@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 # packages used to complete program
 import sys
 import socket
@@ -281,8 +283,9 @@ if(operation == "mv"):
         #print(port_number)
         
         # sending the upload command to the server 
-        s.send(("STOR " + path +"\r\n").encode())
         
+        s.send(("STOR " + path + "\r\n").encode())
+        print(s.recv(8192))
         # giving an issue
         data_connection_socket = socket.create_connection((ip_address, port_number))
         context = ssl.create_default_context()
