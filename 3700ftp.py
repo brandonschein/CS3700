@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 
 # packages used to complete program
 import sys
@@ -283,7 +283,7 @@ if(operation == "mv"):
         #print(port_number)
         
         # sending the upload command to the server 
-        
+        print(path)
         s.send(("STOR " + path + "\r\n").encode())
         print(s.recv(8192))
         # giving an issue
