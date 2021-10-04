@@ -206,7 +206,7 @@ if(operation == "mv"):
         file.write(contents)
         file.close()
         secure_s.close()
-        s.send("DELE " + path + "\r\n")
+        s.send(("DELE " + path + "\r\n").encode())
         print(s.recv(8192).decode())
     else:
         s.send(PASV_MSG.encode())
@@ -233,10 +233,11 @@ if(operation == "mv"):
         
         file = open(local_path, "rb")
         file_contents = file.read()
-        secure_s.send(file_contents.encode())
+        secure_s.send(file_contents)
         secure_s.close()
         file.close()
         os.remove(local_path)
 
 s.send(QUIT_MSG.encode())
 print(s.recv(8192))
+s.close()
