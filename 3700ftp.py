@@ -122,7 +122,7 @@ if(operation == "mkdir"):
     print(s.recv(8192).decode())
 if(operation == "rm"):
     # rm <URL>               Delete the file on the FTPS server at the given URL
-    s.send("DELE " + path + "\r\n")
+    s.send(("DELE " + path + "\r\n").encode())
     print(s.recv(8192))
 if(operation == "rmdir"):
     # rmdir <URL>            Delete the directory on the FTPS server at the given URL
