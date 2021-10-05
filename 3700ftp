@@ -137,7 +137,7 @@ if(operation == "ls"):
     context = ssl.create_default_context()
     secure_s = context.wrap_socket(data_connection_socket, server_hostname=hostname)
     
-    #print(secure_s.recv(8192).decode())
+    print(secure_s.recv(8192).decode())
     secure_s.close()
 
 if(operation == "mkdir"):
