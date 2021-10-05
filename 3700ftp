@@ -137,7 +137,7 @@ if(operation == "ls"):
     context = ssl.create_default_context()
     secure_s = context.wrap_socket(data_connection_socket, server_hostname=hostname)
     
-    #print(secure_s.recv(8192).decode())
+    print(secure_s.recv(8192).decode())
     secure_s.close()
 
 if(operation == "mkdir"):
@@ -145,13 +145,13 @@ if(operation == "mkdir"):
 
     # sending the mkdir command to the server and printing the output 
     s.send(("MKD " + path + "\r\n").encode())
-    #print(s.recv(8192).decode())
+    print(s.recv(8192).decode())
 if(operation == "rm"):
     # rm <URL>               Delete the file on the FTPS server at the given URL
 
     # sending the delete command to the server and printing the output 
     s.send(("DELE " + path + "\r\n").encode())
-    #print(s.recv(8192).decode())
+    print(s.recv(8192).decode())
 if(operation == "rmdir"):
     # rmdir <URL>            Delete the directory on the FTPS server at the given URL
 
@@ -264,15 +264,15 @@ if(operation == "mv"):
 
         # sending the delte command to the server, effectively "moving" the file from the server to local
         s.send(("DELE " + path + "\r\n").encode())
-        #print(s.recv(8192).decode())
+        print(s.recv(8192).decode())
     # handling the case that the url came second in which we want the program to move from local to the server 
     else:
-        # establishing a data channel 
+        # establishing a data channel
         s.send(PASV_MSG.encode())
         recieved = s.recv(8192).decode()
-        # print(recieved)
+        #print(recieved)
 
-        # parsing the recieved message for the IP address and port number used to create a secure connection with the server
+        # parsing the recieved message for the IP address and port number that will be used for creating a secure connection
         split_recieved = recieved.split("(")
         pruning_message = split_recieved[1].split(",")
         ip_address = pruning_message[0] + "." + pruning_message[1] + "." + pruning_message[2] + "." + pruning_message[3]
@@ -282,16 +282,16 @@ if(operation == "mv"):
         #print(ip_address)
         #print(port_number)
         
-        # sending the upload command to the server , giving a 553 issue ?
-        #print(path)
-        s.send(("STOR " + path + "\r\n").encode())
-        print(s.recv(8192))
+        # sending the upload command to the server
+        s.send(("STOR " + local +"\r\n").encode())
+        
+        # creating a secure TLS socket connection 
         data_connection_socket = socket.create_connection((ip_address, port_number))
         context = ssl.create_default_context()
         secure_s = context.wrap_socket(data_connection_socket, server_hostname=hostname)
         
-        # reading the contents of the file into a variable and sending it to the server and then closing 
-        # the file and the connection to the server
+        # opening the local file and reading the contents to another variable to be sent to the server via the secure connection 
+        # and then closing both the file and the secure connection
         file = open(local, "rb")
         file_contents = file.read()
         secure_s.send(file_contents)
