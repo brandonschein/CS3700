@@ -137,7 +137,7 @@ if(operation == "ls"):
     context = ssl.create_default_context()
     secure_s = context.wrap_socket(data_connection_socket, server_hostname=hostname)
     
-    print(secure_s.recv(8192).decode())
+    #print(secure_s.recv(8192).decode())
     secure_s.close()
 
 if(operation == "mkdir"):
@@ -264,7 +264,7 @@ if(operation == "mv"):
 
         # sending the delte command to the server, effectively "moving" the file from the server to local
         s.send(("DELE " + path + "\r\n").encode())
-        print(s.recv(8192).decode())
+        #print(s.recv(8192).decode())
     # handling the case that the url came second in which we want the program to move from local to the server 
     else:
         # establishing a data channel
@@ -303,5 +303,5 @@ if(operation == "mv"):
 
 # asking the FTP server to close the connection and then disconnecting our socket
 s.send(QUIT_MSG.encode())
-print(s.recv(8192))
+#print(s.recv(8192))
 s.close()
