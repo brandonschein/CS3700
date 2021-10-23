@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+
+# note, imported ipaddress for easy comparisons within the program
+import argparse, socket, time, json, select, struct, math, ipaddress
+
+#DEBUG = True
+DEBUG = False
+
+parser = argparse.ArgumentParser(description='route packets')
+parser.add_argument('asn', type=int, help="AS Number")
+parser.add_argument('networks', metavar='networks', type=str, nargs='+', help="networks")
+args = parser.parse_args()
+
+##########################################################################################
+
+# Message Fields
+TYPE = "type"
+SRCE = "src"
+DEST = "dst"
+MESG = "msg"
+TABL = "table"
+
+# Message Types
+DATA = "data"
+DUMP = "dump"
+UPDT = "update"
+RVKE = "revoke"
+NRTE = "no route"
+
+# Update Message Fields
+NTWK = "network"
+NMSK = "netmask"
+ORIG = "origin"
+LPRF = "localpref"
+APTH = "ASPath"
+SORG = "selfOrigin"
+
+# internal route info
+CUST = "cust"
+PEER = "peer"
+PROV = "prov"
+
+
+##########################################################################################
+
+class Router:
+
+    routes = None
+    updates = None
+    relations = None
+    sockets = None
+
+    def __init__(self, networks):
+        self.routes = {}
+        self.updates = []
+        self.revokes = [] # added to store revoke packets 
+        self.relations = {}
+        self.sockets = {}
+        for relationship in networks:
+            network, relation = relationship.split("-")
+            if DEBUG: 
+                print("Starting socket for", network, relation)
+            self.sockets[network] = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            self.sockets[network].setblocking(0)
+            self.sockets[network].connect(network)
+            self.relations[network] = relation
+        return
+
+    def lookup_routes(self, daddr):
+        """ Lookup all valid routes for an address """
+        outroutes = []
+        for neighbor_route in self.routes.items():
+            # gets the routes from this ip
+            routes_for_neighbor = self.routes[neighbor_route[0]] 
+            # searches through the routes to see if there is a route to the daddr 
+            for route in routes_for_neighbor:
+                # https://www.kite.com/python/answers/how-to-check-if-an-ip-address-is-in-a-network-in-python 
+                if (ipaddress.ip_address(daddr) in ipaddress.ip_network((route[NTWK], route[NMSK]))):
+                    outroutes.append((neighbor_route[0], route))
+        return outroutes
+
+    def get_shortest_as_path(self, routes):
+        """ select the route with the shortest AS Path """
+        outroutes = []
+
+        # find the shortest AS Path by going through all routes and comparing their AS Path's
+        min_AS_Path = 1000000000000
+        for route in routes:
+            if(len(route[1][APTH]) < min_AS_Path):
+                min_AS_Path = len(route[1][APTH])
+
+        # go through all routes and add to the outroutes routes that have the same AS Path as the shortest 
+        for route in routes:
+            if(len(route[1][APTH]) == min_AS_Path):
+                outroutes.append(route)   
+
+        return outroutes
+            
+    def get_highest_preference(self, routes):
+        """ select the route with the shortest AS Path """
+        outroutes = []
+
+        # find the highest local pref in the routes 
+        max_pref = -1
+        for route in routes:
+            if(route[1][LPRF] > max_pref):
+                max_pref = route[1][LPRF]
+
+        # go through all routes and add to the outroutes routes that have the same local pref
+        for route in routes:
+            if(route[1][LPRF] == max_pref):
+                outroutes.append(route)
+         
+        return outroutes
+         
+    def get_self_origin(self, routes):
+        """ select self originating routes """     
+        outroutes = []
+        
+        # search for self origin routes in routes
+        for route in routes:
+            # SORG is either true or false for each route, if it is true we want to return it 
+            if route[1][SORG]:
+                outroutes.append(route)
+
+        # if there were self origin routes found, then they are returned, if not we return our original routes list
+        if len(outroutes) > 0:
+            return outroutes
+        else: 
+            return routes    
+
+    def get_origin_routes(self, routes):
+        """ select origin routes: IGP > EGP > UNK """    
+        outroutes = []
+        origin_values = {"IGP": 0, "EGP": 1, "UNK": 2}
+        
+        # finds what the lowest origin value in the routes is 
+        lowest_orig = 1000000000
+        for route in routes:
+            if(origin_values[route[1][ORIG]] < lowest_orig):
+                lowest_orig = origin_values[route[1][ORIG]]
+
+        # goes through and adds routes that have the same origin value as the lowest origin value in the roues
+        for route in routes:
+            if(origin_values[route[1][ORIG]] == lowest_orig):
+                outroutes.append(route)
+        
+        # if there are routes in outroutes, we will return those, otherwise we just return the original routes
+        if (len(outroutes) > 0):
+            return outroutes
+        else: return routes
+        
+    def get_lowest_ip_address(self, routes):
+        """ Select route with lowest neighbor router IP address. """
+        # https://docs.python.org/3/howto/sorting.html
+        return sorted(routes, key=lambda route: ipaddress.ip_address(route[0]))    
+
+    def filter_relationships(self, srcif, routes):
+        """ Don't allow Peer->Peer, Peer->Prov, or Prov->Peer forwards """
+        # If the router is a customer, then router should forward the data.
+        if self.relations[srcif] == CUST:
+            return routes
+        # if the router is not a customer, go through the rouets to see if there are any customers that we need 
+        # to forward the data to
+        else:
+            outroutes = []
+            # Only use routes for customers.
+            for route in routes:
+                if self.relations[route[0]] == CUST:
+                    outroutes.append(route)           
+            return outroutes
+
+    def get_longest_prefix(self, daddr, route):
+
+            # https://stackoverflow.com/questions/2733788/convert-ip-address-string-to-binary-in-python
+
+            daddr_bits = ''.join([bin(int(x)+256)[3:] for x in daddr.split('.')])
+            ip_bits = ''.join([bin(int(x)+256)[3:] for x in (route[1][NTWK]).split('.')])
+            netmask_bits = ''.join([bin(int(x)+256)[3:] for x in (route[1][NMSK]).split('.')])
+
+            AND_ip = ""
+            # anding together the bits of the network and netmask to get the bits of the shown ip address
+            for i in range(len(ip_bits)):
+                    if ip_bits[i] == "1" and netmask_bits[i] == "1":
+                        AND_ip += "1"
+                    else:
+                        AND_ip += "0"
+
+            # Get the length of the prefix match and then return it 
+            match = 0
+            matched = True
+            i = 0
+            # while the bits matched, add 1 to the match count and increment the index, otherwise if they didn't
+            # match, we have our length of matching bits and we are ready to return 
+            while(matched):
+                if(AND_ip[i] == daddr_bits[i]):
+                    match += 1
+                    i += 1
+                else:
+                    matched = False
+            
+            return match  
+  
+
+    def get_route(self, srcif, daddr):
+        """	Select the best route for a given address	"""
+        peer = None
+        routes = self.lookup_routes(daddr)
+        # Rules go here
+        if routes:
+            # 1. Highest Preference
+            routes = self.get_highest_preference(routes)
+            # 2. Self Origin
+            routes = self.get_self_origin(routes)
+            # 3. Shortest ASPath
+            routes = self.get_shortest_as_path(routes)
+            # 4. IGP > EGP > UNK
+            routes = self.get_origin_routes(routes)
+            # 5. Lowest IP Address
+            routes = self.get_lowest_ip_address(routes)
+            # Final check: enforce peering relationships
+            routes = self.filter_relationships(srcif, routes)
+
+            max_route_prefix = -1
+            for route in routes:
+                prefix_length = self.get_longest_prefix(daddr, route)
+                if(prefix_length > max_route_prefix):
+                    max_route_prefix = self.get_longest_prefix(daddr, route)
+                    peer = route
+            
+            # if len(routes) > 0:
+            #     peer = max(routes, key=lambda route: self.get_longest_prefix(daddr, route))
+            #     print(peer)
+
+        return self.sockets[peer[0]] if peer else None
+
+    #forward a packet
+    def forward(self, srcif, packet):
+        """	Forward a data packet	"""
+        # get the routes to forward to 
+        route = self.get_route(srcif, packet[DEST])
+        # if route is not a None, as would be if get_route did not find anything, then forward to those routes 
+        if (route != None):
+            route.sendall(json.dumps(packet).encode())
+            return True
+        return False
+
+
+    def adjacent_numerically(self, r1, r2):
+        """ Return true if both routes are adjacent numerically. """
+        if r1[NMSK] != r2[NMSK]:
+            return False
+        netmask = ''.join([bin(int(x)+256)[3:] for x in (r1[NMSK]).split('.')])
+        
+        netmask_1_count = 0 
+        for i in netmask:
+            if(i == "1"):
+                netmask_1_count += 1
+        r1_network_bits = ''.join([bin(int(x)+256)[3:] for x in (r1[NTWK]).split('.')])
+        
+        r2_network_bits = ''.join([bin(int(x)+256)[3:] for x in (r2[NTWK]).split('.')])
+        
+        return r1_network_bits[:netmask_1_count - 1] == r2_network_bits[:netmask_1_count - 1]
+
+
+    def coalesce(self):
+        """ Coalesce any routes that are right next to each other. """
+        coalesced_routes = []
+
+        for neighbor_router in self.routes:
+            # Get routes for this neighbor router. We may need to coalesce
+            # again.
+            current_routes = self.routes[neighbor_router]
+            # If this neighbor router has no routes, skip this iteration of the loop
+            if len(current_routes) == 0:
+                continue
+
+            tmp_routes = []
+            run_loop = True
+            while run_loop:
+                coalesce_again = False
+                
+                current_route = current_routes[0]
+                for route in range(1, len(current_routes)):
+                    # Both routes forward to the same next-hop router.
+                    if(current_route[LPRF] == current_routes[route][LPRF] and current_route[SORG] == current_routes[route][SORG] and current_route[APTH] == current_routes[route][APTH] and current_route[ORIG] == current_routes[route][ORIG] and self.adjacent_numerically(current_route, current_routes[route])):
+                        r1_network = ipaddress.ip_network((current_route[NTWK], current_route[NMSK]))
+                        r2_network = ipaddress.ip_network((current_routes[route][NTWK], current_routes[route][NMSK]))
+                        netmask = ''.join([bin(int(x)+256)[3:] for x in (current_route[NMSK]).split('.')])
+
+                        count_of_1 = 0
+                        for i in netmask:
+                            if(i == "1"):
+                                count_of_1 += 1
+                        
+                        new_network = ipaddress.ip_network((current_route[NTWK], count_of_1 - 1))
+                        
+                        new_route = {
+                            NTWK: current_route[NTWK],
+                            NMSK: str(new_network.netmask),
+                            LPRF: current_route[LPRF],
+                            SORG: current_route[SORG],
+                            APTH: current_route[APTH],
+                            ORIG: current_route[ORIG]
+                        }
+
+                        current_route = new_route
+                        
+                        coalesce_again = True
+                    else:
+                        tmp_routes.append(current_route)
+                        current_route = current_routes[route]
+                tmp_routes.append(current_route)
+                if coalesce_again:
+                    current_routes = tmp_routes
+                    tmp_routes = []
+                else:
+                    run_loop = False
+
+            # Add the coalesced routes to the list of all routes.
+            routes_to_add = map(lambda route: (
+                neighbor_router, route), tmp_routes)
+            coalesced_routes += routes_to_add
+
+        return coalesced_routes
+        
+
+    #build the update message. Refer to the project webpage for json description
+    def build_updated_msg(self, packet, ip):
+        updated_msg = {
+            SRCE: ip.replace('.2', '.1'),
+            DEST: ip,
+            TYPE: UPDT,
+            MESG: {
+                NTWK: packet[MESG][NTWK],
+                NMSK: packet[MESG][NMSK],
+                LPRF: packet[MESG][LPRF],
+                SORG: packet[MESG][SORG],
+                APTH: packet[MESG][APTH] + [args.asn],
+                ORIG: packet[MESG][ORIG],
+            }
+        }
+
+        return updated_msg    
+
+    def update(self, srcif, packet):
+        """	handle update packets	"""
+        #save the announcement
+        self.updates.append(packet)
+        
+        #update the routing table
+        if self.routes.get(srcif):
+            self.routes[srcif].append(packet[MESG])
+        else: self.routes[srcif] = [packet[MESG]]     
+
+        # if the packet comes from a customer, forward it in the network
+        if (self.relations[srcif] == CUST):
+            for socket in self.sockets:
+                if (socket != srcif):
+                    toSend = self.build_updated_msg(packet, socket)
+                    self.sockets[socket].sendall(json.dumps(toSend).encode())
+        else:
+            for socket in self.sockets:
+                if (self.relations[socket] == CUST):
+                    toSend = self.build_updated_msg(packet, socket)
+                    self.sockets[socket].sendall(json.dumps(toSend).encode())
+        return True
+        
+
+    def build_revoked_msg(self, packet, ip):
+        revoked_msg = {
+            SRCE: ip.replace('.2', '.1'),
+            DEST: ip,
+            TYPE: RVKE,
+            MESG: packet[MESG]
+        }
+        return revoked_msg
+    
+    def revoke(self, srcif, packet):
+        """	handle revoke packets	"""
+        # Save revocation copy
+        self.revokes.append(packet)
+
+        routes_for_neighbor = self.routes[srcif]
+        revocations = packet[MESG]
+
+        updated_routes = []
+        for route in routes_for_neighbor:
+            for revo in revocations:
+                if not (revo[NTWK] == route[NTWK] and revo[NMSK] == route[NMSK]):
+                    updated_routes.append(route)
+        self.routes[srcif] = updated_routes
+
+        if (self.relations[srcif] == CUST):
+            for socket in self.sockets:
+                if (socket != srcif):
+                    toSend = self.build_revoked_msg(packet, socket)
+                    self.sockets[socket].sendall(json.dumps(toSend).encode())
+        else:
+            for socket in self.sockets:
+                if (self.relations[socket] == CUST):
+                    toSend = self.build_revoked_msg(packet, socket)
+                    self.sockets[socket].sendall(json.dumps(toSend).encode())
+        return True
+
+
+
+    def dump(self, packet):
+        #construct a forwarding message object to get into the list
+        #refer to the json construction on the project webpage
+       
+        forwarding_routes = []
+        coalesce_routes_arr = self.coalesce()
+        for route in coalesce_routes_arr:
+            msg_object = {
+                NTWK: route[1][NTWK],
+                NMSK: route[1][NMSK],
+                PEER: route[0]
+            }
+            forwarding_routes.append(msg_object)
+        srcif = packet[SRCE]
+        #refer to the json construction on the project webpage
+        
+        table_message = {
+            SRCE: packet[DEST],
+            DEST: srcif,
+            TYPE: TABL,
+            MESG: forwarding_routes
+        }
+        self.sockets[srcif].send(json.dumps(table_message).encode())
+        return True
+
+    def handle_packet(self, srcif, packet):
+        """	dispatches a packet """
+        #self-explanatory I think
+        if packet[TYPE] == DATA:
+            return self.forward(srcif, packet)
+        elif packet[TYPE] == UPDT:
+            return self.update(srcif, packet)
+        elif packet[TYPE] == DUMP:
+            return self.dump(packet)
+        elif packet[TYPE] == RVKE:
+            return self.revoke(srcif, packet)     
+        else: self.send_error(self, packet, srcif)
+
+    # builds the no route message that run has the program send if there are no routes
+    def send_error(self, conn, msg, srcif):
+        """ Send a no_route error message """
+        error_msg = {
+            SRCE: srcif.replace('.2', '.1'),
+            DEST: msg[SRCE],
+            TYPE: NRTE,
+            MESG: {}
+        }
+        conn.sendall(json.dumps(error_msg).encode())
+        return False
+
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                try:
+                    k = conn.recv(65535)
+                except:
+                    # either died on a connection reset, or was SIGTERM's by parent
+                    return
+                if k:
+                    for sock in self.sockets:
+                        if self.sockets[sock] == conn:
+                            srcif = sock
+                    msg = json.loads(k)
+                    if not self.handle_packet(srcif, msg):
+                        self.send_error(conn, msg, srcif)
+                else:
+                    return
+        return
+
+if __name__ == "__main__":
+    router = Router(args.networks)
+    router.run()
