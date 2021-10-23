@@ -70,13 +70,17 @@ class Router:
         """ Lookup all valid routes for an address """
         outroutes = []
         for neighbor_route in self.routes.items():
+            if(DEBUG): print(neighbor_route)
             # gets the routes from this ip
-            routes_for_neighbor = self.routes[neighbor_route[0]] 
+            routes_from_neighbor = self.routes[neighbor_route[0]] 
             # searches through the routes to see if there is a route to the daddr 
-            for route in routes_for_neighbor:
+            for route in routes_from_neighbor:
+                if(DEBUG): print(route)
                 # https://www.kite.com/python/answers/how-to-check-if-an-ip-address-is-in-a-network-in-python 
                 if (ipaddress.ip_address(daddr) in ipaddress.ip_network((route[NTWK], route[NMSK]))):
+                    if(DEBUG): print("here, in daddr in network check")
                     outroutes.append((neighbor_route[0], route))
+        if(DEBUG): print(outroutes)
         return outroutes
 
     def get_shortest_as_path(self, routes):
@@ -89,10 +93,14 @@ class Router:
             if(len(route[1][APTH]) < min_AS_Path):
                 min_AS_Path = len(route[1][APTH])
 
+        if(DEBUG): print(min_AS_Path)
+
         # go through all routes and add to the outroutes routes that have the same AS Path as the shortest 
         for route in routes:
             if(len(route[1][APTH]) == min_AS_Path):
                 outroutes.append(route)   
+
+        if(DEBUG): print(outroutes)
 
         return outroutes
             
@@ -106,11 +114,14 @@ class Router:
             if(route[1][LPRF] > max_pref):
                 max_pref = route[1][LPRF]
 
+        if(DEBUG): print(max_pref)
+
         # go through all routes and add to the outroutes routes that have the same local pref
         for route in routes:
             if(route[1][LPRF] == max_pref):
                 outroutes.append(route)
-         
+        
+        if(DEBUG): print(outroutes)
         return outroutes
          
     def get_self_origin(self, routes):
@@ -122,7 +133,7 @@ class Router:
             # SORG is either true or false for each route, if it is true we want to return it 
             if route[1][SORG]:
                 outroutes.append(route)
-
+        if(DEBUG): print(outroutes)
         # if there were self origin routes found, then they are returned, if not we return our original routes list
         if len(outroutes) > 0:
             return outroutes
@@ -139,12 +150,12 @@ class Router:
         for route in routes:
             if(origin_values[route[1][ORIG]] < lowest_orig):
                 lowest_orig = origin_values[route[1][ORIG]]
-
+        if(DEBUG): print(lowest_orig)
         # goes through and adds routes that have the same origin value as the lowest origin value in the roues
         for route in routes:
             if(origin_values[route[1][ORIG]] == lowest_orig):
                 outroutes.append(route)
-        
+        if(DEBUG): print(outroutes)
         # if there are routes in outroutes, we will return those, otherwise we just return the original routes
         if (len(outroutes) > 0):
             return outroutes
@@ -153,23 +164,27 @@ class Router:
     def get_lowest_ip_address(self, routes):
         """ Select route with lowest neighbor router IP address. """
         # https://docs.python.org/3/howto/sorting.html
+        if(DEBUG): print(sorted(routes, key=lambda route: ipaddress.ip_address(route[0])))
         return sorted(routes, key=lambda route: ipaddress.ip_address(route[0]))    
 
     def filter_relationships(self, srcif, routes):
         """ Don't allow Peer->Peer, Peer->Prov, or Prov->Peer forwards """
-        # If the router is a customer, then router should forward the data.
+        # If router is a customer, forward the data
         if self.relations[srcif] == CUST:
+            if(DEBUG): pring("here, in filter_relationships in self.relations[srcif] == CUST")
             return routes
-        # if the router is not a customer, go through the rouets to see if there are any customers that we need 
+        # if router is not a customer, go through the routes to see if there are any customers that we need 
         # to forward the data to
         else:
             outroutes = []
-            # Only use routes for customers.
+            # Only use routes if a customer
             for route in routes:
                 if self.relations[route[0]] == CUST:
-                    outroutes.append(route)           
+                    outroutes.append(route)   
+            if(DEBUG): print(outroutes)        
             return outroutes
 
+    # gets the longest prefix between the daddr and the given route 
     def get_longest_prefix(self, daddr, route):
 
             # https://stackoverflow.com/questions/2733788/convert-ip-address-string-to-binary-in-python
@@ -180,12 +195,13 @@ class Router:
 
             AND_ip = ""
             # anding together the bits of the network and netmask to get the bits of the shown ip address
-            for i in range(len(ip_bits)):
+            for i in range(0, len(ip_bits)):
                     if ip_bits[i] == "1" and netmask_bits[i] == "1":
                         AND_ip += "1"
                     else:
                         AND_ip += "0"
-
+            if(DEBUG): print(AND_ip)
+            
             # Get the length of the prefix match and then return it 
             match = 0
             matched = True
@@ -199,6 +215,7 @@ class Router:
                 else:
                     matched = False
             
+            if(DEBUG): print(match)
             return match  
   
 
@@ -221,17 +238,15 @@ class Router:
             # Final check: enforce peering relationships
             routes = self.filter_relationships(srcif, routes)
 
+            if(DEBUG): print(routes)
             max_route_prefix = -1
             for route in routes:
                 prefix_length = self.get_longest_prefix(daddr, route)
                 if(prefix_length > max_route_prefix):
                     max_route_prefix = self.get_longest_prefix(daddr, route)
                     peer = route
-            
-            # if len(routes) > 0:
-            #     peer = max(routes, key=lambda route: self.get_longest_prefix(daddr, route))
-            #     print(peer)
-
+        
+        if(DEBUG): print(peer[0])
         return self.sockets[peer[0]] if peer else None
 
     #forward a packet
@@ -241,51 +256,56 @@ class Router:
         route = self.get_route(srcif, packet[DEST])
         # if route is not a None, as would be if get_route did not find anything, then forward to those routes 
         if (route != None):
+            if(DEBUG): print("here, in forward non empty route")
             route.sendall(json.dumps(packet).encode())
             return True
         return False
 
-
-    def adjacent_numerically(self, r1, r2):
-        """ Return true if both routes are adjacent numerically. """
-        if r1[NMSK] != r2[NMSK]:
+    # returns a boolean describing whether or not two given routes are adjacent or not 
+    def adjacent_routes(self, route1, route2):
+        if route1[NMSK] != route2[NMSK]:
             return False
-        netmask = ''.join([bin(int(x)+256)[3:] for x in (r1[NMSK]).split('.')])
+        netmask_bits = ''.join([bin(int(x)+256)[3:] for x in (route1[NMSK]).split('.')])
         
         netmask_1_count = 0 
-        for i in netmask:
+        for i in netmask_bits:
             if(i == "1"):
                 netmask_1_count += 1
-        r1_network_bits = ''.join([bin(int(x)+256)[3:] for x in (r1[NTWK]).split('.')])
+        if(DEBUG): print(netmask_1_count)
+
+        route1_network_bits = ''.join([bin(int(x)+256)[3:] for x in (route1[NTWK]).split('.')])
+        route2_network_bits = ''.join([bin(int(x)+256)[3:] for x in (route2[NTWK]).split('.')])
         
-        r2_network_bits = ''.join([bin(int(x)+256)[3:] for x in (r2[NTWK]).split('.')])
-        
-        return r1_network_bits[:netmask_1_count - 1] == r2_network_bits[:netmask_1_count - 1]
+        if(DEBUG): 
+            print(route1_network_bits[:netmask_1_count - 1])
+            print(route2_network_bits[:netmask_1_count - 1])
+        # https://ttl255.com/working-with-ip-addresses-in-python-ipaddress-library-part-2/#compare
+        return route1_network_bits[:netmask_1_count - 1] == route2_network_bits[:netmask_1_count - 1]
 
 
     def coalesce(self):
         """ Coalesce any routes that are right next to each other. """
         coalesced_routes = []
 
-        for neighbor_router in self.routes:
-            # Get routes for this neighbor router. We may need to coalesce
-            # again.
-            current_routes = self.routes[neighbor_router]
+        for neighbor in self.routes.items():
+            # Get routes for this neighbor router. We may need to coalesce again
+            current_routes = self.routes[neighbor[0]]
             # If this neighbor router has no routes, skip this iteration of the loop
             if len(current_routes) == 0:
+                if(DEBUG): print("here, in skip current router by cont. case")
                 continue
 
-            tmp_routes = []
+            temp_routes = []
             run_loop = True
             while run_loop:
                 coalesce_again = False
                 
                 current_route = current_routes[0]
                 for route in range(1, len(current_routes)):
-                    # Both routes forward to the same next-hop router.
-                    if(current_route[LPRF] == current_routes[route][LPRF] and current_route[SORG] == current_routes[route][SORG] and current_route[APTH] == current_routes[route][APTH] and current_route[ORIG] == current_routes[route][ORIG] and self.adjacent_numerically(current_route, current_routes[route])):
-                        r1_network = ipaddress.ip_network((current_route[NTWK], current_route[NMSK]))
-                        r2_network = ipaddress.ip_network((current_routes[route][NTWK], current_routes[route][NMSK]))
+                    # Both routes forward to the same next-hop router
+                    if(self.adjacent_routes(current_route, current_routes[route]) and current_route[LPRF] == current_routes[route][LPRF] and current_route[SORG] == current_routes[route][SORG] and current_route[APTH] == current_routes[route][APTH] and current_route[ORIG] == current_routes[route][ORIG]):
+                        if(DEBUG): print(current_route)
+                        
                         netmask = ''.join([bin(int(x)+256)[3:] for x in (current_route[NMSK]).split('.')])
 
                         count_of_1 = 0
@@ -293,35 +313,35 @@ class Router:
                             if(i == "1"):
                                 count_of_1 += 1
                         
-                        new_network = ipaddress.ip_network((current_route[NTWK], count_of_1 - 1))
+                        new_network_for_route = ipaddress.ip_network((current_route[NTWK], count_of_1 - 1))
                         
                         new_route = {
                             NTWK: current_route[NTWK],
-                            NMSK: str(new_network.netmask),
+                            NMSK: str(new_network_for_route.netmask),
                             LPRF: current_route[LPRF],
                             SORG: current_route[SORG],
                             APTH: current_route[APTH],
                             ORIG: current_route[ORIG]
                         }
-
+                        if(DEBUG): print(new_route)
                         current_route = new_route
-                        
                         coalesce_again = True
                     else:
-                        tmp_routes.append(current_route)
+                        temp_routes.append(current_route)
                         current_route = current_routes[route]
-                tmp_routes.append(current_route)
+                temp_routes.append(current_route)
                 if coalesce_again:
-                    current_routes = tmp_routes
-                    tmp_routes = []
+                    current_routes = temp_routes
+                    temp_routes = []
                 else:
                     run_loop = False
 
-            # Add the coalesced routes to the list of all routes.
-            routes_to_add = map(lambda route: (
-                neighbor_router, route), tmp_routes)
-            coalesced_routes += routes_to_add
-
+            # Add the coalesced routes to the list of routes
+            add_routes = []
+            for route in temp_routes:
+                add_routes.append((neighbor[0], route))
+            coalesced_routes += add_routes
+        if(DEBUG): print(coalesced_routes)
         return coalesced_routes
         
 
@@ -340,7 +360,7 @@ class Router:
                 ORIG: packet[MESG][ORIG],
             }
         }
-
+        if(DEBUG): print(updated_msg)
         return updated_msg    
 
     def update(self, srcif, packet):
@@ -374,12 +394,14 @@ class Router:
             TYPE: RVKE,
             MESG: packet[MESG]
         }
+        if(DEBUG): print(revoked_msg)
         return revoked_msg
     
     def revoke(self, srcif, packet):
         """	handle revoke packets	"""
         # Save revocation copy
         self.revokes.append(packet)
+
 
         routes_for_neighbor = self.routes[srcif]
         revocations = packet[MESG]
@@ -410,8 +432,8 @@ class Router:
         #refer to the json construction on the project webpage
        
         forwarding_routes = []
-        coalesce_routes_arr = self.coalesce()
-        for route in coalesce_routes_arr:
+        
+        for route in self.coalesce():
             msg_object = {
                 NTWK: route[1][NTWK],
                 NMSK: route[1][NMSK],
@@ -427,6 +449,7 @@ class Router:
             TYPE: TABL,
             MESG: forwarding_routes
         }
+        if(DEBUG): print(table_message)
         self.sockets[srcif].send(json.dumps(table_message).encode())
         return True
 
@@ -452,6 +475,7 @@ class Router:
             TYPE: NRTE,
             MESG: {}
         }
+        if(DEBUG): print(error_msg)
         conn.sendall(json.dumps(error_msg).encode())
         return False
 
