@@ -1,0 +1,106 @@
+#!/usr/bin/python3
+#
+# CS3700, Fall 2021
+# TCP Project Starter Code
+
+import datetime
+import json
+import sys
+import socket
+
+from base64 import b64decode
+
+
+def log(string):
+  sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " 3700recv: " + string + "\n")
+
+MSG_SIZE = 1500
+TIMEOUT = 30
+DATA_READ = 0
+RECEIVED_PACKETS = []
+
+# Bind to localhost and an ephemeral port
+UDP_IP = "127.0.0.1"
+UDP_PORT = int(sys.argv[1])
+
+# Set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind((UDP_IP, UDP_PORT))
+sock.settimeout(TIMEOUT)
+
+# Get port we bound to
+UDP_PORT = sock.getsockname()[1]
+log("[bound] " + str(UDP_PORT))
+# Now listen for packets
+while True:
+  result = sock.recvfrom(MSG_SIZE)
+
+  # If nothing is ready, we hit the timeout
+  if result:
+    (data, addr) = result
+    data = data.decode()
+    try:
+      decoded = json.loads(data)
+      # log("decoded["sequence"] " + str(decoded["sequence"]))
+      # log("length of decoded["data"] " + str(len(decoded["data"])))
+      # log("decoded["ack"] " + str(decoded["ack"]))
+      # log("decoded["eof"] " + str(decoded["eof"]))
+      # If the "eof" flag is set, exit
+      # log("decoded in recv 56 " + str(decoded))
+      if (decoded["eof"]):
+        if decoded["sequence"] == DATA_READ:
+          # 5 is the number of teardown acks 
+          for x in range(5):
+            # Send back an ACK to the sender.
+            msg = json.dumps({"ack": decoded["sequence"], "sack": decoded["sequence"]})
+            log("ABOUT TO SEND EOF " + msg)
+            if sock.sendto(msg.encode(), addr) < len(msg):
+              log("[error] unable to fully send packet")
+          log("[complete] 66")
+          sys.exit(0)
+    
+      #else:
+      # If there is data, we accept it and print it out
+      if (decoded["data"]):
+        sequence_num = decoded["sequence"]
+
+        # If we receive data, we assume it's in-order
+        # You will need to do much more here
+        cur_buf_seq = list(map(lambda packet: packet["sequence"], RECEIVED_PACKETS))
+        log("cur_buf_seq " + str(cur_buf_seq))
+        if sequence_num not in cur_buf_seq and sequence_num >= DATA_READ:
+          if sequence_num == DATA_READ:
+            log(f"[recv data] {sequence_num} ({len(decoded['data'])}) ACCEPTED (in-order)")
+          else:
+            log(f"[recv data] {sequence_num} ({len(decoded['data'])}) ACCEPTED (out-of-order)")
+          RECEIVED_PACKETS.append(decoded)
+        else:
+          log("IGNORED")
+        # log("[recv data] " + str(decoded['sequence']) + " (" + str(len(data)) + ") ACCEPTED (in-order)")
+        # sys.stdout.buffer.write(b64decode(decoded['data'].encode()))
+
+
+
+      # process received packets
+      packets_sort = sorted(RECEIVED_PACKETS, key=lambda packet: packet["sequence"])
+      for packet in packets_sort:
+        if packet["sequence"] == DATA_READ:
+          decoded_data = b64decode(packet["data"].encode())
+          sys.stdout.buffer.write(decoded_data)
+          DATA_READ = packet["sequence"] + len(decoded_data)
+      RECEIVED_PACKETS = list(filter(lambda packet: packet["sequence"] > DATA_READ, packets_sort))
+
+      # sending an ack to the sender
+      msg = json.dumps({"ack": DATA_READ, "sack": decoded["sequence"]})
+      log("sending ack msg: " + msg)
+      sent = sock.sendto(msg.encode(), addr)
+      log("[sent] " + str(sent))
+      if sent < len(msg):
+        log("[error] unable to fully send packet")
+
+    except (ValueError, KeyError, TypeError) as e:
+      log("[recv corrupt packet]")
+      raise e
+  else:
+    log("[error] timeout")
+    sys.exit(-1)
