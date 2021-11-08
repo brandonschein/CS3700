@@ -1,0 +1,159 @@
+#!/usr/bin/python3
+#
+# CS3700, Fall 2021
+# TCP Project Starter Code
+
+import datetime
+import json
+import sys
+import socket
+import time
+
+from base64 import b64encode
+
+# setting up default values
+MSG_SIZE = 1500
+DATA_SIZE = 1000
+TIMEOUT = 30
+SEQUENCE = 0
+LAST_PACK_TIME = None
+RTT = 0.1
+
+packets_sent = dict()
+
+# Bind to localhost and port
+IP_PORT = sys.argv[1]
+UDP_IP = IP_PORT[0:IP_PORT.find(":")]
+UDP_PORT = int(IP_PORT[IP_PORT.find(":")+1:])
+dest = (UDP_IP, UDP_PORT)
+
+time.sleep(.5)
+
+# Set up the socket for use in the below program
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(0.1)
+
+def log(string):
+  sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " 3700send: " + string + "\n")
+
+def send_next_packet():
+  global SEQUENCE
+  global packets_sent
+  global RTT
+
+  # log ("b64encryption: " + str(b64encode(data)))
+  msg = {"sequence": SEQUENCE, "data": "", "ack": False, "eof": False}
+  data = sys.stdin.buffer.read(DATA_SIZE - len(json.dumps(msg)))
+  msg["data"] = b64encode(data).decode()
+  # msg = json.dumps({"sequence": SEQUENCE, "data": b64encode(data).decode(), "ack": False, "eof": False})
+  if (len(msg["data"]) > 0):
+    # log("data " + str(data))
+    if sock.sendto(json.dumps(msg).encode(), dest) < len(msg):
+      log("[error] unable to fully send packet")
+    else:
+      log("[send data] " + str(SEQUENCE) + " (" + str(len(data)) + ")")
+      packet_send_time = time.time()
+      packet_timeout = packet_send_time + (2 * RTT)
+      packets_sent[SEQUENCE] = {
+          "packet message": msg,
+          "packet send time": packet_send_time,
+          "packet timeout": packet_timeout,
+          "packet retransmissions": 0
+        }
+      # some debugging statements used for the nettest and nettsim to see whats happening
+      log("len(packets_sent) " + str(len(packets_sent)))
+      log("packets_sent[SEQUENCE] " + str(packets_sent[SEQUENCE]))
+      log("SEQUENCE " + str(SEQUENCE))
+    SEQUENCE += len(data)
+    return True
+  else:
+    # deal with an EOF
+    eof_msg = {"eof": True, "data": "", "sequence": SEQUENCE, "ack": False}
+    if sock.sendto(json.dumps(eof_msg).encode(), dest) < len(eof_msg):
+      log("[error] unable to fully send packet")
+    else:
+      log(f"[send data eof] {SEQUENCE} ({len(eof_msg)})")
+      packet_send_time = time.time()
+      packet_timeout = packet_send_time + (2 * RTT)
+      packets_sent[SEQUENCE] = {
+        "packet message": eof_msg,
+        "packet send time": packet_send_time,
+        "packet timeout": packet_timeout,
+        "packet retransmissions": 0
+      }
+    sock.sendto(json.dumps(eof_msg).encode(), dest)
+    return False
+
+send_next_packet()
+LAST_PACK_TIME = time.time()
+
+# read in data and send packetss
+while True:
+  log("ABOUT TO SLEEP")
+  try:
+      result = sock.recvfrom(MSG_SIZE)
+      log("recv success")
+  except socket.timeout:
+      result = None
+  if result:
+    # update the last packet recieved 
+    LAST_PACK_TIME = time.time()
+    (data, addr) = result
+    try:
+      decoded = json.loads(data.decode())
+      log("[recv pkt] " + str(decoded))
+      log("[recv ack] " + str(decoded['ack']))
+      log("packets_sent " + str(packets_sent))
+
+      sack = decoded["sack"]
+      if sack in packets_sent:
+        sent_packet = packets_sent[sack]
+        
+        if sent_packet["packet retransmissions"] == 0:
+          # update RTT 
+          packet_send_time = sent_packet["packet send time"] 
+          RTT = 0.875 * RTT + (0.125) * (time.time() - packet_send_time)
+        packets_sent.pop(sack)
+
+      unacked_seq_nums = list(packets_sent.keys())
+      # log("unacked_seq_nums " + str(unacked_seq_nums))
+      for seq_num in unacked_seq_nums: 
+        # For the given ACK, every sequence number must be less than acknowledment received
+        if seq_num < decoded["ack"]:
+            packets_sent.pop(seq_num)
+
+      # If ack try to send next packet
+      log("decoded['ack] " + str(decoded["ack"]))
+      log("SEQUENCE " + str(SEQUENCE))
+      if decoded["ack"] == SEQUENCE and not send_next_packet():
+        break
+
+    except (ValueError, KeyError, TypeError):
+      log("[recv corrupt packet]")
+  current_time = time.time()
+  if ((current_time - LAST_PACK_TIME) > (TIMEOUT * 1000)):
+    log("[error] timeout")
+    sys.exit(-1)
+  else:
+    log("len packets_sent " + str(len(packets_sent)))  
+    for seq_num in packets_sent:
+        log ("seq_num " + str(seq_num))
+        # resend packet if RTO has expired
+        sent_packet = packets_sent[seq_num]
+        if (current_time > sent_packet["packet timeout"]):
+          # retransmit the packet
+          packet = sent_packet
+          msg = packet["packet message"]
+          if (len(msg) > sock.sendto(json.dumps(msg).encode(), dest)):
+            log("[error] unable to fully send packet due to it being too long")
+          else:
+            log(f"[retransmit data] {seq_num} ({len(msg['data'])})")
+            packet_send_time = time.time()
+            packet_timeout = packet_send_time + 2 * RTT * (packet["packet retransmissions"] + 1)
+            packets_sent[seq_num] = {
+              "packet message": msg,
+              "packet send time": packet_send_time,
+              "packet timeout": packet_timeout,
+              "packet retransmissions": packet["packet retransmissions"] + 1
+            }
+sys.exit(0)
