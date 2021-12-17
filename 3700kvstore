@@ -7,41 +7,28 @@ my_id = sys.argv[1]
 # The ID numbers of all the other replicas
 replica_ids = sys.argv[2:]
 
-# A list of the next log entry index to send to each server
-NEW_LOGS = dict()
-# List of the highest log index that we know each server has replicated
-HIGHEST_INDICIES = dict()
-# Map from replica to timeout.  Allows us to skip heartbeat for replicas that were sent updates
-HEARTBEATS = dict()
-# The key/value KEY_VALUE_PAIRS for this replica
-KEY_VALUE_PAIRS = dict()
-# The log for this replica (initialize with empty value at 0 so we can use 1 indexing)
-LOG = [None] 
-# setting up default values for the server
-# The number of replicas needed to reach NUM_VOTES_NEEDED, and the number of those that we have gotten (default is 1 since this replica will always agree wil itself)
+# default values for a new instance of 3700kvstore
+STATE = 'follower'
+VOTED_FOR = None
+TERM = 1
+LEADER = 'FFFF'
+APP_TIMER = None
+GREATEST_INDEX = 0
+LAST_APPLIED = 0
 NUM_VOTES_NEEDED = int(math.trunc((float((len(replica_ids) + 1)) / 2.0) + 1))
 NUM_RESPONSES = 1
-# The timestamp of our last timeout, and the random time until our next timeout respectively
-LAST_TO = float(time.time() * 1000)
-ELECTION_TO = random.randrange(150, 300)
-# Documents the state of the replica (can be follower, candidate, or leader)
-STATE = 'follower'
-# Which replica we voted for in the current term
-VOTED_FOR = None
-# The term number that this replica is on
-TERM = 1
-# The Leader for this term
-LEADER = 'FFFF'
 
-# The timer that the replica will use if it is a leader to send appendRCs
-APP_TIMER = None
-# Highest log entry known to be committed
-COMMIT_INDEX = 0
-# Highest log entry applied
-LAST_APPLIED = 0
+# making empty dictionaries for global usage in program
+NEW_LOGS = dict()
+HIGHEST_INDICIES = dict()
+HEARTBEATS = dict()
+KEY_VALUE_PAIRS = dict()
+# adding a None to start with so indexing is easier
+LOG = [None] 
 
-
-
+# setting up the starting of the election in the event loop
+PREVIOUS_TIMEOUT = time.time()
+NEW_TIMEOUT = random.randrange(150, 300)/1000
 
 # Connect to the network. All messages to/from other replicas and clients will
 # occur over this socket
@@ -72,72 +59,113 @@ def recv_msgs(sock):
     return msgs
 
 
-# Handles interaction with the client
-def handle_client_message(msg):
+# respond to a clients message (either get or put)
+def client_messages(msg):
     global KEY_VALUE_PAIRS
     global LOG
-    # If there is aknown known leader, and we are not that leader, redirect to the leader
+    # we only want to respond if we are the leader
     if LEADER != 'FFFF' and LEADER != my_id:
         msg = {'src': my_id, 'dst': msg['src'], 'leader': LEADER, 'MID': msg['MID'], 'type': 'redirect'}
         sock.send(json.dumps(msg).encode() + TERMINATOR)
-    # If we are the leader, add the entry to our log
+    # if we are the leader, then respond to the message
     elif LEADER == my_id:
-        # responding to client about get request as leader
         if msg['type'] == 'get':
+            # respond with the value if it exists, or nothing if it doesn't 
             if msg['key'] in KEY_VALUE_PAIRS:
                 response_msg = {'src': my_id, 'dst': msg['src'], 'leader': LEADER, 'MID': msg['MID'], 'type': 'ok', 'value': KEY_VALUE_PAIRS[msg['key']]}
             else:
                 response_msg = {'src': my_id, 'dst': msg['src'], 'leader': LEADER, 'MID': msg['MID'], 'type': 'ok', 'value': ''}
             sock.send(json.dumps(response_msg).encode() + TERMINATOR)
-        else:
+        # put the message into the log and update followers
+        elif msg['type'] == 'put':
             log_entry = {'src': msg['src'], 'dst': msg['dst'], 'leader': msg['leader'], 'type': msg['type'], 'MID': msg['MID'], 'key': msg['key'], 'value': msg['value'], 'term': TERM}
             LOG.append(log_entry)
-            send_appends()
-    # Else there is no leader (perhaps due to election), fail request
+            send_appendRC()
+        else:
+            print("Weird error in client messages, shouldn't get here")
     else:
-        #print(my_id + ' got msg during election with leader ' + LEADER)
         msg = {'src': my_id, 'dst': msg['src'], 'leader': LEADER, 'MID': msg['MID'], 'type': 'fail'}
         sock.send(json.dumps(msg).encode() + TERMINATOR)
 
-  
-# Triggers the election process by making this replica a candidate and upping the term, then asking for votes
-def trigger_election():
+# to trigger an election 
+def new_election():
     global STATE
     global TERM
     global NUM_RESPONSES
     global LEADER
-    global LAST_TO
-    global ELECTION_TO
+    global PREVIOUS_TIMEOUT
+    global NEW_TIMEOUT
     global LOG
-
+    # updating the current replica 
     STATE = 'candidate'
     LEADER = 'FFFF'
     NUM_RESPONSES = 1
     TERM += 1
-    # start timeout again in case there is a split vote
-    # Get time, multiply by 1000 to get in ms (easier to compare whole numbers vs decimals
-    LAST_TO = float(time.time() * 1000)
-    # Choose a random number for timeout between 150 and 300 ms
-    ELECTION_TO = random.randrange(150, 300)
+    PREVIOUS_TIMEOUT = time.time()
+    NEW_TIMEOUT = random.randrange(150, 300)/1000
     last_term = -1
     last_index = -1
-    # If log is not empty, use index and term of last element in log
     if len(LOG) > 1:
         last_index = len(LOG) - 1
         last_term = LOG[last_index]['term']
-    vote_req = {'src': my_id, 'dst': 'FFFF', 'leader': LEADER, 'type': 'vote-req', 'term': TERM, 'last-index': last_index, 'last-term': last_term}
-    sock.send(json.dumps(vote_req).encode() + TERMINATOR)
+    # send out the vote-request
+    vote_request = {'src': my_id, 'dst': 'FFFF', 'leader': LEADER, 'type': 'vote-req', 'term': TERM, 'last-index': last_index, 'last-term': last_term}
+    sock.send(json.dumps(vote_request).encode() + TERMINATOR)
 
+# dealing with the vote accept and reject messages
+def vote_outcome(vote_outcome):
+    global STATE
+    global LEADER
+    global NUM_RESPONSES
+    global HEARTBEATS
+    global NEW_LOGS
+    global HIGHEST_INDICIES
+    global APP_TIMER
+    global PREVIOUS_TIMEOUT
+    global NEW_TIMEOUT
+    global TERM
+    global VOTED_FOR
+    # dealing with the outcome of the vote-accept message
+    if vote_outcome == 'vote-accept':
+        print(my_id + " was accepted by " + msg['src'] + " at term " + str(TERM))
+        if STATE == 'candidate':
+            NUM_RESPONSES += 1
+            if NUM_RESPONSES >= NUM_VOTES_NEEDED:
+                print(my_id + " is the new leader")
+                STATE = 'leader'
+                LEADER = my_id
+                NUM_RESPONSES = 1
+                APP_TIMER = time.time()
+                HEARTBEATS = dict()
+                NEW_LOGS = dict()
+                HIGHEST_INDICIES = dict()
+                for rid in replica_ids:
+                    NEW_LOGS[rid] = len(LOG)
+                    HIGHEST_INDICIES[rid] = 0
+                    HEARTBEATS[rid] = time.time()
+    # dealing with the outcome of the vote-reject message
+    elif vote_outcome == 'vote-reject':
+        if STATE == 'candidate':
+            if msg['term'] > TERM:
+                STATE = 'follower'
+                TERM = msg['term']
+                NUM_RESPONSES = 1
+                LEADER = msg['leader']
+                VOTED_FOR = None
+                PREVIOUS_TIMEOUT = time.time()
+                NEW_TIMEOUT = random.randrange(150, 300)/1000
+    else:
+        print("weird error in vote_outcome, should not be possible to get here")
 
-# Checks if the candidate meets the requirements in 5.4.1
-def check_log_reqs(msg):
+# does the replica meet the requirements from the raft paper to be a leader
+def meets_log_requirements(msg):
     global LOG
+    # # If our log is empty, theirs must be at least as up to date as ours, so always true
+    if len(LOG) == 1:
+        return True
     # -1 for last term and index means an empty log.  This happens in startup, so if our log is also empty, we vote.
     if msg['last-term'] == -1 and msg['last-index'] == -1:
         return len(LOG) == 1
-    # If our log is empty, theirs must be at least as up to date as ours, so always true
-    if len(LOG) == 1:
-        return True
     # If their last term is larger than ours, return true
     if LOG[len(LOG) - 1]['term'] < msg['last-term']:
         return True
@@ -148,157 +176,79 @@ def check_log_reqs(msg):
     else:
         return False
 
-
-# Determines whether or not to cast a vote for a given candidate
-def handle_vote(msg):
+# determines if a vote should be cast for a candidate
+def cast_vote(msg):
     global STATE
     global TERM
     global LEADER
     global VOTED_FOR
-    global LAST_TO
-    global ELECTION_TO
-
-    # If we encounter a vote req with a higher term, we vote no matter what
-    # If we were a candidate or a leader with a lower term, revert to a follower since you clearly goofed up
+    global PREVIOUS_TIMEOUT
+    global NEW_TIMEOUT
+    # vote for the higher term request no matter what and become a follower
     if msg['term'] > TERM:
         STATE = 'follower'
-        TERM = msg['term'] # May need to move these three lines back into the if
+        TERM = msg['term'] 
         LEADER = 'FFFF'
         VOTED_FOR = None
-    # If candidate log is up to date and we have not voted in this term, vote
+    # if we havent voted and the candidates are up to date then vote
     need_to_vote = True
     if VOTED_FOR != None:
         need_to_vote = VOTED_FOR == msg['src']
-    if check_log_reqs(msg) and need_to_vote:
+    if need_to_vote and meets_log_requirements(msg) :
         VOTED_FOR = msg['src']
         vote_ack = {'src': my_id, 'dst': msg['src'], 'leader': LEADER, 'type': 'vote-accept', 'term': TERM}
-        # Reset our timeout as we anticipate this candidate becomming the leader
-        # Get time, multiply by 1000 to get in ms (easier to compare whole numbers vs decimals
-        LAST_TO = float(time.time() * 1000)
-        # Choose a random number for timeout between 150 and 300 ms
-        ELECTION_TO = random.randrange(150, 300)
+        PREVIOUS_TIMEOUT = time.time()
+        NEW_TIMEOUT = random.randrange(150, 300)/1000
         sock.send(json.dumps(vote_ack).encode() + TERMINATOR)
-    # Else reject
     else:
         vote_rej = {'src': my_id, 'dst': msg['src'], 'leader': LEADER, 'type': 'vote-reject', 'term': TERM}
         sock.send(json.dumps(vote_rej).encode() + TERMINATOR)
 
-# Increments the number of votes received and crowns a leader if NUM_VOTES_NEEDED was reached
-def handle_vote_accept():
-    global STATE
-    global LEADER
-    global NUM_RESPONSES
-    global HEARTBEATS
-    global NEW_LOGS
-    global HIGHEST_INDICIES
-    global APP_TIMER
-    print(my_id + ' accepted by: ' + msg['src'] + ' in term ' + str(TERM))
-    if STATE == 'candidate':
-        NUM_RESPONSES += 1
-        if NUM_RESPONSES >= NUM_VOTES_NEEDED:
-            print(my_id + ' was crowned as leader! Long may they reign!')
-            STATE = 'leader'
-            LEADER = my_id
-            NUM_RESPONSES = 1
-            APP_TIMER = float(time.time() * 1000)
-            # initialize nextIndex to our last index + 1 and matchIndex to 0
-            HEARTBEATS = dict()
-            NEW_LOGS = dict()
-            HIGHEST_INDICIES = dict()
-            for rid in replica_ids:
-                # Since we start the log with an empty value at index 0, this works
-                NEW_LOGS[rid] = len(LOG)
-                HIGHEST_INDICIES[rid] = 0
-                HEARTBEATS[rid] = float(time.time() * 1000)
 
-# Handles a rejected vote.  If the term in the rejection is higher than ours, become a follower and change term to match
-def handle_vote_reject(msg):
-    global STATE
-    global TERM
-    global NUM_RESPONSES
-    global LEADER
-    global VOTED_FOR
-    global LAST_TO
-    global ELECTION_TO
-    print(my_id + ' rejected by: ' + msg['src'])
-    if STATE == 'candidate':
-        # In this case, we are behind and should adopt the leader and term of the replica that replied, becomming a follower
-        if msg['term'] > TERM:
-            STATE = 'follower'
-            TERM = msg['term']
-            NUM_RESPONSES = 1
-            LEADER = msg['leader']
-            VOTED_FOR = None
-            # Get time, multiply by 1000 to get in ms (easier to compare whole numbers vs decimals
-            LAST_TO = float(time.time() * 1000)
-            # Choose a random number for timeout between 150 and 300 ms
-            ELECTION_TO = random.randrange(150, 300)
-
-
-# Updates the log with the new entries
+# updates log with any new message entries
 def update_log(start_index, entries):
     global LOG
-    log_index = start_index
     entry_index = 0
-    # If we see an inconsistancy, set this flag to overwrite all subsequent entries
-    overwrite = False
-    # Loop through and check entries until we reach the end of the list
-    while log_index < len(LOG) and entry_index < len(entries):
-        # If overwrite is set, replace the entry
-        if overwrite:
-            LOG[log_index] = entries[entry_index]
-            log_index += 1
-            entry_index += 1
-        else:
-            # If new and existing entries at the same index have differing terms, we have a conflict and must overwrite
-            # the current entry and all following ones
-            if LOG[log_index]['term'] != entries[entry_index]['term']:
-                overwrite = True
-                LOG[log_index] = entries[entry_index]
-            log_index += 1
-            entry_index += 1
-
-    # Append any remaing entries to the end of log
+    
+    while start_index < len(LOG) and entry_index < len(entries):
+        if LOG[start_index]['term'] != entries[entry_index]['term']:
+            LOG[start_index] = entries[entry_index]
+        start_index += 1
+        entry_index += 1
+    # if any entries are left, put them in the log
     while entry_index < len(entries):
         LOG.append(entries[entry_index])
         entry_index += 1
 
-
-# Handles an AppendRC message
-def handle_append(msg):
+# dealing with the AppendRC message 
+def appendRC(msg):
     global STATE
     global TERM
     global LEADER
-    global COMMIT_INDEX
-    global LAST_TO
-    global ELECTION_TO
-    # In the case of heartbeat, we do not want to reply so initialize to None
+    global GREATEST_INDEX
+    global PREVIOUS_TIMEOUT
+    global NEW_TIMEOUT
     reply = None
-    # No matter what state we are in, we should become follower if the leader has larger term than us
+    # become follower if leader has larger term
     if msg['term'] > TERM:
         STATE = 'follower'
         TERM = msg['term']
         LEADER = msg['leader']
-    # If we are a leader and our term is bigger, send a fail so this other leader knows about us
+    # let other leader know about us 
     elif STATE == 'leader' :
         reply = {'src': my_id, 'dst': msg['src'], 'leader': LEADER, 'type': 'append-reply', 'term': TERM, 'success': False}
         sock.send(json.dumps(reply).encode() + TERMINATOR)
         return
-    # Always update the leader for followers (just in case)
     else:
         LEADER = msg['leader']
 
-    # reset timeout
-    # Get time, multiply by 1000 to get in ms (easier to compare whole numbers vs decimals
-    LAST_TO = float(time.time() * 1000)
-    # Choose a random number for timeout between 150 and 300 ms
-    ELECTION_TO = random.randrange(150, 300)
+    # reset the timeout for the replica
+    PREVIOUS_TIMEOUT = time.time()
+    NEW_TIMEOUT = random.randrange(150, 300)/1000
 
-    # Only update log and commit index if we are a follower
+    # only updating indecies if we are a follower
     if STATE == 'follower':
-        # If entries are not empty, we should try to update log
         if len(msg['entries']) > 0:
-            # if the entry at prevIndex has the same term as prevLogTerm, we can proceed
             term_same = False
             if msg['prev-log-index'] < len(LOG):
                 if msg['prev-log-index'] != 0:
@@ -306,59 +256,46 @@ def handle_append(msg):
                 else:
                     term_same = True
             if term_same:
-                reply = {'src': my_id, 'dst': msg['src'], 'leader': LEADER, 'type': 'append-reply', 'term': TERM, 'success': True,
-                'new_index': msg['prev-log-index'] + len(msg['entries'])}
+                reply = {'src': my_id, 'dst': msg['src'], 'leader': LEADER, 'type': 'append-reply', 'term': TERM, 'success': True, 'new_index': msg['prev-log-index'] + len(msg['entries'])}
                 sock.send(json.dumps(reply).encode() + TERMINATOR)
                 update_log(msg['prev-log-index'] + 1, msg['entries'])
-            # Otherwise, send fail message
+            # failure
             else:
                 reply = {'src': my_id, 'dst': msg['src'], 'leader': LEADER, 'type': 'append-reply', 'term': TERM, 'success': False}
                 sock.send(json.dumps(reply).encode() + TERMINATOR)
+        # update the leaders commit index if necessary
+        if msg['leader-commit'] > GREATEST_INDEX:
+            GREATEST_INDEX = min(msg['leader-commit'], len(LOG) - 1)
 
-        # Always update commitIndex if leader has a higher one. Take min of that index and our log length
-        if msg['leader-commit'] > COMMIT_INDEX:
-            COMMIT_INDEX = min(msg['leader-commit'], len(LOG) - 1)
-
-# Handles the response to an append message
-def handle_append_reply(msg):
-    global STATE
-    global LEADER
-    global TERM
-    global VOTED_FOR
-    global NEW_LOGS
-    global HIGHEST_INDICIES
-
-    # If the append succeeded, update match and next indices for replica
-    if msg['success']:
-        NEW_LOGS[msg['src']] = msg['new_index'] + 1
-        HIGHEST_INDICIES[msg['src']] = msg['new_index']
-    # Otherwise, figure out why it failed
-    else:
-        # If the term is larger, there is a more up-to-date leader out there, revert to follower
-        if msg['term'] > TERM:
-            STATE = 'follower'
-            TERM = msg['term']
-            LEADER = msg['leader']
-            VOTED_FOR = None
-        # Else, we need to decrement next index for the replica and try again
-        else:
-            NEW_LOGS[msg['src']] = NEW_LOGS[msg['src']] - 1
-
-# Checks that the applyIndex is up to date.  If it is not, it increments it and applies the changes up to the new index.
-# ****LEADER ONLY***** Sends replies to client for each change applied from the log
-def check_apply_index():
+# if any followers have an index less than the last log index, update them
+def send_appendRC():
+    global HEARTBEATS
+    for rid in replica_ids:
+        next_ind = NEW_LOGS[rid]
+        if next_ind <= len(LOG) - 1:
+            end_ind = len(LOG)
+            if end_ind - next_ind > 500:
+                end_ind = 500 + next_ind
+            append = {'src': my_id, 'dst': rid, 'leader': LEADER, 'type': 'append-entries', 'term': TERM, 'leader-commit': GREATEST_INDEX,
+            'prev-log-index': next_ind - 1, 'prev-log-term': None, 'entries': LOG[next_ind:end_ind]}
+            # if this is not the first append we must include the term
+            if next_ind > 1:
+                append['prev-log-term'] = LOG[next_ind - 1]['term']
+            sock.send(json.dumps(append).encode() + TERMINATOR)
+            HEARTBEATS[rid] = time.time()
+   
+# check that applied is up to date 
+def check_last_applied():
     global LAST_APPLIED
-    global COMMIT_INDEX
+    global GREATEST_INDEX
     global LOG
     global KEY_VALUE_PAIRS
-    # If we can commit more changes, do it
-    if COMMIT_INDEX > LAST_APPLIED:
-        to_apply = LOG[LAST_APPLIED + 1: COMMIT_INDEX + 1]
+
+    if GREATEST_INDEX > LAST_APPLIED:
+        to_apply = LOG[LAST_APPLIED + 1: GREATEST_INDEX + 1]
         for entry in to_apply:
-            # If the entry is a put, execute the put by storing the key/value pair
             if entry['type'] == 'put':
                 KEY_VALUE_PAIRS[entry['key']] = entry['value']
-            # If we are the leader, reply to the client that we have done the operation
             if STATE == 'leader':
                 response_msg = {'src': my_id, 'dst': entry['src'], 'leader': LEADER, 'MID': entry['MID'], 'type': 'ok'}
                 if entry['type'] == 'get':
@@ -367,58 +304,30 @@ def check_apply_index():
                     else:
                         response_msg = {'src': my_id, 'dst': entry['src'], 'leader': LEADER, 'MID': entry['MID'], 'type': 'ok', 'value': ''}
                 sock.send(json.dumps(response_msg).encode() + TERMINATOR)
-        LAST_APPLIED = COMMIT_INDEX
+        # updating last applied value 
+        LAST_APPLIED = GREATEST_INDEX
 
-# Searches through the matchIndices and tries to find value N that is common to the majority
-# and is greater than our commitIndex.  If such a value exists, make it the new commitIndex
-def check_commit_index():
-    global COMMIT_INDEX
+# searches for a value that is greater than our commit index in the majority
+def check_greatest_index():
+    global GREATEST_INDEX
     match_ind = list(HIGHEST_INDICIES.values())
-    # sort the list so the following loop logic works
     match_ind.sort()
     index_occurances = dict()
-    # iterate through the keys
     for ind in match_ind:
-        # since our list is sorted, every key in the map is either this index or a smaller index.
-        # since we know that this index was matched, any smaller index was also matched so increment them as well.
         for key in index_occurances:
             index_occurances[key] = index_occurances[key] + 1
-        # if this is the first instance of the index, start it at 2 to account for the leader having this index too
         if ind not in index_occurances:
             index_occurances[ind] = 2
-    # temp value for new commitIndex
-    new_commit = COMMIT_INDEX
-    # loop through index occurances and see if any occur a majority of the time
+    new_commit = GREATEST_INDEX
     for key in index_occurances:
-        # if the index has a majoirty, make it the new index if it exceeds the current value
         if index_occurances[key] >= NUM_VOTES_NEEDED:
             new_commit = max(new_commit, key)
-    # Update the commit index
-    if COMMIT_INDEX == 0:
-        COMMIT_INDEX = new_commit
-    elif LOG[new_commit]['term'] == TERM:
-        COMMIT_INDEX = new_commit
+    if GREATEST_INDEX == 0 or LOG[new_commit]['term'] == TERM:
+        GREATEST_INDEX = new_commit
+    
 
-# Checks for any followers that have nextIndex < our last log index.
-# If one is found, send an AppendRC to update it
-def send_appends():
-    global HEARTBEATS
-    for rid in replica_ids:
-        next_ind = NEW_LOGS[rid]
-        if next_ind <= len(LOG) - 1:
-            end_ind = len(LOG)
-            if end_ind - next_ind > 500:
-                end_ind = 500 + next_ind
-            append = {'src': my_id, 'dst': rid, 'leader': LEADER, 'type': 'append-entries', 'term': TERM, 'leader-commit': COMMIT_INDEX,
-            'prev-log-index': next_ind - 1, 'prev-log-term': None, 'entries': LOG[next_ind:end_ind]}
-            # If this is not the first append, we will need to include the term
-            if next_ind > 1:
-                append['prev-log-term'] = LOG[next_ind - 1]['term']
-            sock.send(json.dumps(append).encode() + TERMINATOR)
-            HEARTBEATS[rid] = float(time.time() * 1000)
 
-# Start initial countdown for first timeout to trigger election
-# reset_timeout()
+#event loop
 while True:
     ready = select.select([sock], [], [], SELECT_WAIT_TIME)[0]
 
@@ -428,59 +337,54 @@ while True:
         for msg in msgs:
 
             if msg['type'] in ['get', 'put']:
-                handle_client_message(msg)
+                client_messages(msg)
 
             elif msg['type'] == 'vote-req':
-                #print('Received vote req from ' + msg['src'])
-                handle_vote(msg)
+                print("Received vote request from " + msg['src'])
+                cast_vote(msg)
 
-            elif msg['type'] == 'vote-accept':
-                handle_vote_accept()
+            elif msg['type'] == 'vote-accept' or msg['type'] == 'vote-reject':
+                vote_outcome(msg['type'])
 
-            elif msg['type'] == 'vote-reject':
-                handle_vote_reject(msg)
 
-            # Handle append-entries, at this point just use as heartbeat
             elif msg['type'] == 'append-entries':
-                handle_append(msg)
+                appendRC(msg)
 
             # Handle the reply to the append, only if you are the leader
-            elif msg['type'] == 'append-reply':
-                if STATE == 'leader':
-                    handle_append_reply(msg)
-                    #check_commit_index()
+            elif STATE == 'leader':
+                if msg['type'] == 'append-reply':
+                    if msg['success']:
+                        NEW_LOGS[msg['src']] = msg['new_index'] + 1
+                        HIGHEST_INDICIES[msg['src']] = msg['new_index']
+                    else:
+                        if msg['term'] > TERM:
+                            STATE = 'follower'
+                            TERM = msg['term']
+                            LEADER = msg['leader']
+                            VOTED_FOR = None
+                        # Else, we need to decrement next index for the replica and try again
+                        else:
+                            NEW_LOGS[msg['src']] = NEW_LOGS[msg['src']] - 1
 
-            #check_apply_index()
-
-    # If we are the leader, check if we have a majority of replicas that have accepted N changes where N > committed
-    # If so, commit all changes up to N
     if STATE == 'leader':
-        check_commit_index()
+        check_greatest_index()
+    check_last_applied()
 
-    # Check if the commitIndex is greater than lastApplied, if so, apply all changes up to that point
-    check_apply_index()
-
-    # Leaders do not care about timeouts.  Only enter if not a leader
+    # leaders dont care about timeouts
     if STATE != 'leader':
-        if ((time.time() * 1000) - LAST_TO) > ELECTION_TO:
-            #print('Timed out with time ' + str((time.time() * 1000) - LAST_TO) + 'ms greater than ' + str(ELECTION_TO) + 'ms')
-            trigger_election()
+        if (time.time() - PREVIOUS_TIMEOUT) > NEW_TIMEOUT:
+            new_election()
+            print("Starting a new election, started by " + str(my_id))
 
-    # This loop is for the leader to send regular heartbeats to prevent unneeded elections
+    # sending heartbeats 
     if STATE == 'leader':
-        # 100 = APP_LIMIT, 
-        if ((time.time() * 1000) - APP_TIMER) >= 100:
-            send_appends()
-            APP_TIMER = float(time.time() * 1000)
+        if (time.time() - APP_TIMER) >= .1:
+            send_appendRC()
+            APP_TIMER = time.time()
 
         for rid in replica_ids:
-            # 75 to bound the limit of the heartbeat length
-            if ((time.time() * 1000) - HEARTBEATS[rid]) >= 75:
-                hb = {'src': my_id, 'leader': LEADER, 'type': 'append-entries', 'term': TERM, 'leader-commit': COMMIT_INDEX, 'entries': []}
-                # Reset heartbeat timer
-                HEARTBEATS[rid] = float(time.time() * 1000)
-                # Send heartbeat to each replica
-                #for rid in replica_ids:
-                hb['dst'] = rid
+            if (time.time() - HEARTBEATS[rid]) >= .075:
+                hb = {'src': my_id, 'leader': LEADER, 'type': 'append-entries', 'term': TERM, 'leader-commit': GREATEST_INDEX, 'entries': [], 'dst': rid}
+                HEARTBEATS[rid] = time.time()
                 sock.send(json.dumps(hb).encode() + TERMINATOR)
 
